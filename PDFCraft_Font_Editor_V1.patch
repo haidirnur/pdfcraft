@@ -1,0 +1,542 @@
+--- /dev/null
++++ b/BUILD-FONT-EDITOR.ps1
+@@ -0,0 +1,22 @@
++param([switch] $RunTests)
++$ErrorActionPreference = 'Stop'
++Set-Location -LiteralPath $PSScriptRoot
++if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
++    throw 'Cargo not found. Install Rust 1.95+ with the MSVC toolchain and reopen PowerShell.'
++}
++if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
++    throw 'Rustup not found. Install the Rust MSVC toolchain through rustup.'
++}
++function Invoke-Checked([scriptblock] $Command) {
++    & $Command
++    if ($LASTEXITCODE -ne 0) { throw "Command failed with exit code $LASTEXITCODE" }
++}
++Invoke-Checked { rustup target add x86_64-pc-windows-msvc }
++if ($RunTests) {
++    Invoke-Checked { cargo test --locked -p pdfcraft-ui-egui --lib edit_text_ui:: }
++}
++Invoke-Checked { cargo build --locked --release -p pdfcraft --target x86_64-pc-windows-msvc }
++$TargetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { 'target' }
++$Exe = Join-Path $TargetDir 'x86_64-pc-windows-msvc\release\pdfcraft.exe'
++if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) { throw "Build exited without expected executable: $Exe" }
++Write-Host "Build completed: $((Resolve-Path -LiteralPath $Exe).Path)"
+--- /dev/null
++++ b/FONT-EDITOR-CHANGELOG.md
+@@ -0,0 +1,51 @@
++# PDFCraft 0.22.0 — Font Editor V1 (unofficial source revision)
++
++Base: user-supplied PDFCraft v0.22.0 archive, commit ac140f809d554981a5276d748e6193fcf4d4bdfa.
++This is a source revision, not a compiled or signed release. No upstream version number or dependencies were changed.
++
++## Changes
++- Edit a PDF sidebar: Document fonts section is visible before selecting existing text. Import font and Installed fonts are direct actions.
++- Format text: dedicated import/installed-font actions alongside the existing font dropdown. The existing installed-font discovery, search and family grouping are reused.
++- TTF/OTF: register on the current PDF page. When a specific paragraph initiated the picker, apply to that paragraph only if it remains open. If it is no longer open, register without rewriting text. The existing document/generation guard remains in place.
++- Explicitly report if registration succeeded but the font catalogue cannot list the face for immediate application.
++- A pending resource change counts as an edit; a caret-only (empty) range applies the font to the whole paragraph.
++- Existing font validator, Unicode embedding, resource selection, save and undo mechanisms retained. No font binaries or dependencies were added.
++
++## Scope and limitations
++- Custom font support is for existing editable PDF text. Add Text uses the existing standard-family renderer; custom Add Text is not implemented in V1. The UI explicitly reports this limitation.
++- Import is per page, not a persistent application font library; use the dropdown for registered faces on that page. Imports and text rewrites are separate undo steps.
++- Only static standalone fonts satisfying upstream validation, including its open-licence and embedding policy. No bypass of licence restrictions; font collections and variable fonts are not supported.
++- Existing source paragraph rewrite restrictions, text overflow, glyph coverage, and bounded font catalogue remain applicable. Existing font resources are not a permanent cross-document library.
++- The picker guards the originating document, generation, page and paragraph index. It does not freeze the original text selection range if a user changes that selection in the same open paragraph.
++- No installer, portable executable, binary or runtime validation was produced here. Rust/Cargo is unavailable in the development container. The new tests are written but unexecuted. The changes may require corrections after compilation.
++
++## Windows build
++Use Windows 10/11 x64, Rust 1.95 or newer (MSVC toolchain), Visual Studio Build Tools with Desktop development with C++, Windows SDK, Git, and network access to fetch the pinned dependencies. Follow upstream docs/development.md for optional build assets.
++
++Open PowerShell at the extracted repository root. To build the GUI:
++
++```powershell
++rustup target add x86_64-pc-windows-msvc
++cargo build --locked --release -p pdfcraft --target x86_64-pc-windows-msvc
++```
++
++The executable should be at `target\x86_64-pc-windows-msvc\release\pdfcraft.exe` after a successful build. The supplied `BUILD-FONT-EDITOR.ps1` runs that build; use `-RunTests` to run the text-editor library tests first. Do not replace your installed application until tests pass. Keep backups of PDFs and test using Save As.
++
++For official-style Windows packaging, see docs/releasing.md and packaging/windows/package.ps1. That process needs the additional WiX v5, OCR assets, optional font notices and other upstream prerequisites. The resulting local artifacts will not be official or signed unless separately configured with authorized signing credentials.
++
++## QC acceptance (not run)
++1. Open a copy of a PDF containing selectable text. Open Edit a PDF; confirm Document fonts is visible before choosing a paragraph.
++2. Import an eligible static `.ttf` (e.g. a licensed Inter face). Confirm the existing page text is unchanged until you explicitly apply the face.
++3. Click an existing paragraph and select the face from Format text. Verify displayed typeface, point size, text content, and baseline. Save As, reopen in PdfCraft and an independent reader, and check text selection/search.
++4. Repeat by using the direct Import font button while an existing paragraph is selected. Confirm font applies to that paragraph or its selected range. Test Installed fonts, Reload, search and family selection.
++5. Import an eligible `.otf` and repeat. Test empty caret, selected range, undo/redo (registration and rewrite are separate steps), malformed font, disallowed embedding, and a changed document/paragraph while selecting a file.
++6. Confirm Add Text still uses only supported standard families and does not imply custom font support.
++
++## Added regression tests (not executed)
++- `choosing_a_document_face_marks_the_draft_changed_even_with_only_a_caret`
++- `import_before_selecting_text_registers_without_rewriting_and_survives_save`
++- `a_font_pick_for_another_paragraph_does_not_change_the_open_paragraph`
++- `invalid_import_does_not_change_the_document`
++Existing `a_loaded_font_is_applied_to_the_paragraph_being_edited` was updated for the explicit paragraph target.
++
++Recommended verification: `cargo fmt --check`; `cargo clippy --locked -p pdfcraft-ui-egui --all-targets -- -D warnings`; `cargo test --locked -p pdfcraft-ui-egui`; `cargo test --locked -p pdfcraft-engine`.
+--- a/crates/ui-egui/src/panels/edit.rs
++++ b/crates/ui-egui/src/panels/edit.rs
+@@ -54,6 +54,18 @@
+     }
+     // Format text at the top while text is selected or being added.
+     format_section(app, ui, t);
++    // Make import discoverable even before a text paragraph has been opened.
++    if let Some((index, _)) = app.active_ids()
++        && app.views[index].line_editor.is_none()
++    {
++        let page = app.views[index].current;
++        let enabled = pdfcraft_engine::commands::command("edit.edit_text").is_some_and(|spec| app.command_enabled(spec));
++        widgets::section_title(ui, tl!("Document fonts"));
++        let choice = ui.add_enabled_ui(enabled, crate::format_text_ui::import_controls).inner;
++        ui.label(tl!("Import fonts for the current page, then select existing text to apply them."));
++        handle_font_import(app, page, None, choice);
++        ui.add_space(6.0);
++    }
+     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+         super::tools::clear_of_scrollbar(ui);
+         widgets::section_title(ui, tl!("Modify page"));
+@@ -289,6 +301,7 @@
+         if let Some(script) = out.script {
+             changed |= crate::edit_text_ui::toggle_script(&mut ed.text, &mut ed.selection, script);
+         }
++        let mut import = None;
+         match out.font {
+             Some(FontChoice::KeepSource) => {
+                 ed.keep_source_font();
+@@ -302,16 +315,16 @@
+                 ed.choose_family(family);
+                 changed = true;
+             }
+-            Some(FontChoice::Load) => app.pick_files(crate::files::FilePurpose::TextFont { page: ed.page }, false),
+-            #[cfg(not(target_arch = "wasm32"))]
+-            Some(FontChoice::Installed(path)) => app.use_paths(crate::files::FilePurpose::TextFont { page: ed.page }, &[path]),
+-            #[cfg(target_arch = "wasm32")]
+-            Some(FontChoice::Installed(_)) => {}
++            choice @ (Some(FontChoice::Load) | Some(FontChoice::Installed(_))) => {
++                import = choice;
++            }
+             None => {}
+         }
++        let (page, block) = (ed.page, ed.block);
+         if changed {
+             app.apply_line_format(i, ed, Some(ui.ctx()));
+         }
++        handle_font_import(app, page, Some(block), import);
+         return;
+     }
+     // Typing added text: the box's formatting, and alignment for the lines a selection touches.
+@@ -382,6 +395,18 @@
+             app.text_style = style;
+         }
+         None => {}
++    }
++}
++
++/// File selection and installed-font selection use the same validated registration path.
++fn handle_font_import(app: &mut PdfCraftApp, page: usize, block: Option<usize>, choice: Option<crate::format_text_ui::FontChoice>) {
++    use crate::format_text_ui::FontChoice;
++    let purpose = crate::files::FilePurpose::TextFont { page, block };
++    match choice {
++        Some(FontChoice::Load) => app.pick_files(purpose, false),
++        #[cfg(not(target_arch = "wasm32"))]
++        Some(FontChoice::Installed(path)) => app.use_paths(purpose, &[path]),
++        _ => {}
+     }
+ }
+ 
+--- a/crates/ui-egui/src/panels/format_text_ui.rs
++++ b/crates/ui-egui/src/panels/format_text_ui.rs
+@@ -26,7 +26,7 @@
+     Resource(String),
+     /// A standard family.
+     Family(FontFamily),
+-    /// Load font…: pick a font file.
++    /// Import font…: pick a font file.
+     Load,
+     /// A font file installed on this computer.
+     Installed(std::path::PathBuf),
+@@ -136,6 +136,96 @@
+     s.trim_end_matches('0').trim_end_matches('.').to_string()
+ }
+ 
++/// The same import actions are available before a paragraph is selected and while editing it.
++pub(crate) fn import_controls(ui: &mut egui::Ui) -> Option<FontChoice> {
++    let mut choice = None;
++    ui.horizontal_wrapped(|ui| {
++        if ui.button(tl!("Import font…"))
++            .on_hover_text(tl!("Import a static, openly licensed TTF or OTF font for this page."))
++            .clicked()
++        {
++            choice = Some(FontChoice::Load);
++        }
++        #[cfg(not(target_arch = "wasm32"))]
++        installed_fonts_menu(ui, &mut choice);
++    });
++    choice
++}
++
++#[cfg(not(target_arch = "wasm32"))]
++fn installed_fonts_menu(ui: &mut egui::Ui, choice: &mut Option<FontChoice>) {
++    ui.menu_button(tl!("Installed fonts…"), |ui| {
++        ui.set_min_width(260.0);
++        let reload = ui.button(tl!("Reload")).clicked();
++        match crate::files::installed_font_files(ui.ctx(), reload) {
++            Some(list) if list.is_empty() => {
++                ui.label(tl!("No openly licensed document fonts found. Load a font file."));
++            }
++            Some(list) => {
++                let search_id = ui.scope_id().with("installed-font-search");
++                let mut query = ui.data(|d| d.get_temp::<String>(search_id)).unwrap_or_default();
++                ui.horizontal(|ui| {
++                    let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
++                    crate::icons::paint(ui, icon_rect, "search", 13.0, ui.visuals().text_color().gamma_multiply(0.6));
++                    let resp = ui.add(egui::TextEdit::singleline(&mut query).hint_text(tl!("Search…")).desired_width(ui.available_width() - 8.0));
++                    if resp.changed() {
++                        ui.data_mut(|d| d.insert_temp(search_id, query.clone()));
++                    }
++                });
++                ui.separator();
++
++                let query_lower = query.trim().to_lowercase();
++                let mut families: std::collections::BTreeMap<&str, Vec<&pdfcraft_engine::text_fonts::FontFile>> = std::collections::BTreeMap::new();
++                for font in &list {
++                    if query_lower.is_empty()
++                        || font.family.to_lowercase().contains(&query_lower)
++                        || font.face.to_lowercase().contains(&query_lower)
++                    {
++                        families.entry(&font.family).or_default().push(font);
++                    }
++                }
++
++                if families.is_empty() {
++                    ui.label(tl!("No openly licensed document fonts found. Load a font file."));
++                } else {
++                    egui::ScrollArea::vertical().max_height(350.0).show(ui, |ui| {
++                        for (family, faces) in families {
++                            if faces.len() == 1 {
++                                if let Some(&font) = faces.first() {
++                                    let label = if font.face != font.family && !font.face.is_empty() { font.face.as_str() } else { family };
++                                    if ui.button(label).clicked() {
++                                        *choice = Some(FontChoice::Installed(font.path.clone()));
++                                        ui.close();
++                                    }
++                                }
++                            } else {
++                                ui.menu_button(family, |ui| {
++                                    ui.set_min_width(180.0);
++                                    for font in faces {
++                                        let label = font
++                                            .face
++                                            .strip_prefix(family)
++                                            .map(str::trim)
++                                            .filter(|s| !s.is_empty())
++                                            .unwrap_or(&font.face);
++                                        if ui.button(label).clicked() {
++                                            *choice = Some(FontChoice::Installed(font.path.clone()));
++                                            ui.close();
++                                        }
++                                    }
++                                });
++                            }
++                        }
++                    });
++                }
++            }
++            None => {
++                ui.label(tl!("Finding document fonts…"));
++            }
++        }
++    });
++}
++
+ pub(crate) fn panel(
+     ui: &mut egui::Ui,
+     t: &Tokens,
+@@ -174,84 +264,11 @@
+                 }
+                 if fonts.sources.is_some() {
+                     ui.separator();
+-                    if ui.selectable_label(false, tl!("Load font…")).clicked() {
++                    if ui.selectable_label(false, tl!("Import font…")).clicked() {
+                         out.font = Some(FontChoice::Load);
+                     }
+                     #[cfg(not(target_arch = "wasm32"))]
+-                    ui.menu_button(tl!("Installed fonts…"), |ui| {
+-                        ui.set_min_width(260.0);
+-                        let reload = ui.button(tl!("Reload")).clicked();
+-                        match crate::files::installed_font_files(ui.ctx(), reload) {
+-                            Some(list) if list.is_empty() => {
+-                                ui.label(tl!("No openly licensed document fonts found. Load a font file."));
+-                            }
+-                            Some(list) => {
+-                                let search_id = ui.scope_id().with("installed-font-search");
+-                                let mut query = ui.data(|d| d.get_temp::<String>(search_id)).unwrap_or_default();
+-                                ui.horizontal(|ui| {
+-                                    let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+-                                    crate::icons::paint(ui, icon_rect, "search", 13.0, ui.visuals().text_color().gamma_multiply(0.6));
+-                                    let resp = ui.add(
+-                                        egui::TextEdit::singleline(&mut query).hint_text(tl!("Search…")).desired_width(ui.available_width() - 8.0),
+-                                    );
+-                                    if resp.changed() {
+-                                        ui.data_mut(|d| d.insert_temp(search_id, query.clone()));
+-                                    }
+-                                });
+-                                ui.separator();
+-
+-                                let query_lower = query.trim().to_lowercase();
+-                                let mut families: std::collections::BTreeMap<&str, Vec<&pdfcraft_engine::text_fonts::FontFile>> =
+-                                    std::collections::BTreeMap::new();
+-                                for font in &list {
+-                                    if query_lower.is_empty()
+-                                        || font.family.to_lowercase().contains(&query_lower)
+-                                        || font.face.to_lowercase().contains(&query_lower)
+-                                    {
+-                                        families.entry(&font.family).or_default().push(font);
+-                                    }
+-                                }
+-
+-                                if families.is_empty() {
+-                                    ui.label(tl!("No openly licensed document fonts found. Load a font file."));
+-                                } else {
+-                                    egui::ScrollArea::vertical().max_height(350.0).show(ui, |ui| {
+-                                        for (family, faces) in families {
+-                                            if faces.len() == 1 {
+-                                                if let Some(&font) = faces.first() {
+-                                                    let label =
+-                                                        if font.face != font.family && !font.face.is_empty() { font.face.as_str() } else { family };
+-                                                    if ui.button(label).clicked() {
+-                                                        out.font = Some(FontChoice::Installed(font.path.clone()));
+-                                                        ui.close();
+-                                                    }
+-                                                }
+-                                            } else {
+-                                                ui.menu_button(family, |ui| {
+-                                                    ui.set_min_width(180.0);
+-                                                    for font in faces {
+-                                                        let label = font
+-                                                            .face
+-                                                            .strip_prefix(family)
+-                                                            .map(str::trim)
+-                                                            .filter(|s| !s.is_empty())
+-                                                            .unwrap_or(&font.face);
+-                                                        if ui.button(label).clicked() {
+-                                                            out.font = Some(FontChoice::Installed(font.path.clone()));
+-                                                            ui.close();
+-                                                        }
+-                                                    }
+-                                                });
+-                                            }
+-                                        }
+-                                    });
+-                                }
+-                            }
+-                            None => {
+-                                ui.label(tl!("Finding document fonts…"));
+-                            }
+-                        }
+-                    });
++                    installed_fonts_menu(ui, &mut out.font);
+                     ui.add_space(4.0);
+                 }
+             })
+@@ -259,6 +276,14 @@
+     });
+     font_resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, ui.is_enabled(), tl!("Font")));
+     font_resp.on_hover_text(format!("{}\n{}", tl!("Font"), tl!("Thai and Arabic use regular fallback fonts when available.")));
++    ui.add_space(4.0);
++    if fonts.sources.is_some() {
++        if let Some(choice) = import_controls(ui) {
++            out.font = Some(choice);
++        }
++    } else {
++        ui.label(tl!("Custom document fonts are available for editing existing PDF text, not for Add Text yet."));
++    }
+     ui.add_space(4.0);
+ 
+     // Size and colour | bullets, numbering and alignment.
+--- a/crates/ui-egui/src/tools/edit_text_ui.rs
++++ b/crates/ui-egui/src/tools/edit_text_ui.rs
+@@ -401,7 +401,12 @@
+ 
+     /// Whether the paragraph with `text` in it differs from what was opened.
+     fn changes_with(&self, text: &str) -> bool {
+-        text != self.original || self.look != self.look0 || self.extras != self.extras0 || self.family_chosen || self.size_chosen
++        text != self.original
++            || self.look != self.look0
++            || self.extras != self.extras0
++            || self.family_chosen
++            || self.size_chosen
++            || self.font_resource.is_some()
+     }
+ 
+     /// Extra width permitted by the editor. Source containers now remain fixed.
+@@ -439,7 +444,7 @@
+         if l.aligns != o.aligns || self.text != self.original || style != pdfcraft_engine::BlockStyle::default() {
+             style.aligns = l.aligns.clone();
+         }
+-        if let Some(range) = &self.selection
++        if let Some(range) = self.selection.as_ref().filter(|range| !range.is_empty())
+             && (style.family.is_some()
+                 || style.resource.is_some()
+                 || style.size.is_some()
+@@ -1780,12 +1785,71 @@
+         let (mut app, ed) = preview_app();
+         app.views[0].line_editor = Some(ed);
+         let inter = include_bytes!("../../../../assets/fonts/Inter-Regular.ttf").to_vec();
+-        app.use_files(crate::files::FilePurpose::TextFont { page: 0 }, vec![("Inter-Regular.ttf".into(), inter)]);
++        app.use_files(crate::files::FilePurpose::TextFont { page: 0, block: Some(0) }, vec![("Inter-Regular.ttf".into(), inter)]);
+         let doc = app.session.get(app.views[0].id).unwrap();
+         let lines = doc.text_lines(0);
+         assert_eq!(lines.iter().map(|l| l.text.as_str()).collect::<String>(), "Preview text");
+         assert!(lines.iter().all(|l| l.base_font == "Inter-Regular"), "{:?}", lines.iter().map(|l| &l.base_font).collect::<Vec<_>>());
+         assert!(app.views[0].line_editor.is_some(), "the paragraph stays open for editing");
++    }
++
++    #[test]
++    fn choosing_a_document_face_marks_the_draft_changed_even_with_only_a_caret() {
++        let (_app, mut ed) = preview_app();
++        ed.selection = Some(1..1);
++        ed.font_resource = Some("CustomFace".into());
++        assert!(ed.has_changes());
++        assert_eq!(ed.style().resource.as_deref(), Some("CustomFace"));
++        assert!(ed.style().ranges.is_empty());
++        ed.applied();
++        assert!(!ed.has_changes());
++    }
++
++    #[test]
++    fn import_before_selecting_text_registers_without_rewriting_and_survives_save() {
++        let (mut app, _) = preview_app();
++        let id = app.views[0].id;
++        let before = app.session.get(id).unwrap().text_lines(0);
++        let inter = include_bytes!("../../../../assets/fonts/Inter-Regular.ttf").to_vec();
++        app.use_files(crate::files::FilePurpose::TextFont { page: 0, block: None }, vec![("Inter-Regular.ttf".into(), inter.clone())]);
++        let doc = app.session.get(id).unwrap();
++        let after = doc.text_lines(0);
++        assert_eq!(
++            before.iter().map(|l| (&l.text, &l.base_font)).collect::<Vec<_>>(),
++            after.iter().map(|l| (&l.text, &l.base_font)).collect::<Vec<_>>()
++        );
++        assert!(doc.text_editor_fonts(0).iter().any(|f| f.bytes == inter));
++        let saved = app.session.save_bytes(id).unwrap();
++        let reopened = app.session.open("font-import.pdf", None, saved, None).unwrap();
++        assert!(app.session.get(reopened).unwrap().text_editor_fonts(0).iter().any(|f| f.bytes == inter));
++    }
++
++    #[test]
++    fn a_font_pick_for_another_paragraph_does_not_change_the_open_paragraph() {
++        let (mut app, ed) = preview_app();
++        let id = app.views[0].id;
++        let before = app.session.get(id).unwrap().text_lines(0);
++        app.views[0].line_editor = Some(ed);
++        let inter = include_bytes!("../../../../assets/fonts/Inter-Regular.ttf").to_vec();
++        app.use_files(crate::files::FilePurpose::TextFont { page: 0, block: Some(1) }, vec![("Inter-Regular.ttf".into(), inter.clone())]);
++        let doc = app.session.get(id).unwrap();
++        let after = doc.text_lines(0);
++        assert_eq!(
++            before.iter().map(|l| (&l.text, &l.base_font)).collect::<Vec<_>>(),
++            after.iter().map(|l| (&l.text, &l.base_font)).collect::<Vec<_>>()
++        );
++        assert!(doc.text_editor_fonts(0).iter().any(|f| f.bytes == inter));
++    }
++
++    #[test]
++    fn invalid_import_does_not_change_the_document() {
++        let (mut app, ed) = preview_app();
++        let id = app.views[0].id;
++        app.views[0].line_editor = Some(ed);
++        let before = app.session.get(id).unwrap().edit_generation();
++        app.use_files(crate::files::FilePurpose::TextFont { page: 0, block: Some(0) }, vec![("invalid.ttf".into(), vec![0, 1, 2, 3])]);
++        assert_eq!(app.session.get(id).unwrap().edit_generation(), before);
++        assert!(app.views[0].line_editor.is_some());
+     }
+ 
+     #[test]
+--- a/crates/ui-egui/src/workflows/files.rs
++++ b/crates/ui-egui/src/workflows/files.rs
+@@ -15,6 +15,8 @@
+ pub enum FilePurpose {
+     TextFont {
+         page: usize,
++        /// Apply only to the paragraph that opened the picker; None registers on the page.
++        block: Option<usize>,
+     },
+     Combine,
+     InsertPages,
+@@ -560,28 +562,39 @@
+     /// Use picked files (also the entry point for tests and automation).
+     pub fn use_files(&mut self, purpose: FilePurpose, files: Vec<(String, Vec<u8>)>) {
+         match purpose {
+-            FilePurpose::TextFont { page } => {
++            FilePurpose::TextFont { page, block } => {
+                 let Some((_, bytes)) = files.into_iter().next() else { return };
+                 let bytes = Arc::new(bytes);
+                 if !self.apply_edit(Edit::RegisterTextFont { page, bytes: bytes.clone() }) {
+                     return;
+                 }
+                 let Some((index, id)) = self.active_ids() else { return };
+-                let Some(mut ed) = self.views[index].line_editor.clone().filter(|ed| ed.page == page) else { return };
+-                // The font just loaded is the one the user wants: apply it to the paragraph, as
+-                // choosing it from the document-font menu does, instead of only registering it (#2591).
++                // The catalogue is bounded; registration alone does not prove the face is selectable.
+                 let resource = self.session.get(id).and_then(|doc| {
+                     doc.text_editor_fonts(page).into_iter().find(|f| f.bytes == *bytes && !f.resource.starts_with("PCApproved")).map(|f| f.resource)
+                 });
+-                let ctx = self.ctx.clone();
+-                if resource.is_some() {
+-                    ed.font_resource = resource;
+-                    self.apply_line_format(index, ed, ctx.as_ref());
+-                } else if let Some(doc) = self.session.get(id)
+-                    && let Some(ctx) = ctx
+-                {
+-                    ed.fonts = crate::edit_text_ui::install_source_fonts(&ctx, doc, page);
+-                    self.views[index].line_editor = Some(ed);
++                // Registering in advance is deliberately not a text edit. An asynchronous picker
++                // must also never apply the face to a different paragraph on the same page.
++                let editor = self.views[index].line_editor.clone().filter(|ed| ed.page == page && block == Some(ed.block));
++                match (resource, editor) {
++                    (Some(resource), Some(mut ed)) => {
++                        ed.font_resource = Some(resource);
++                        let ctx = self.ctx.clone();
++                        self.apply_line_format(index, ed, ctx.as_ref());
++                    }
++                    (Some(_), None) => {
++                        self.notify_tr("Font imported for this page. Select existing text and choose the font from Format text.");
++                    }
++                    (None, editor) => {
++                        if let Some(mut ed) = editor
++                            && let Some(doc) = self.session.get(id)
++                            && let Some(ctx) = self.ctx.as_ref()
++                        {
++                            ed.fonts = crate::edit_text_ui::install_source_fonts(ctx, doc, page);
++                            self.views[index].line_editor = Some(ed);
++                        }
++                        self.notify_tr("Font imported, but could not be listed for immediate application on this page.");
++                    }
+                 }
+             }
+             FilePurpose::Combine => self.stage_combine(files),
+--- a/docs/editing-existing-text.md
++++ b/docs/editing-existing-text.md
+@@ -41,10 +41,16 @@
+ that added item's old drawing removed, so deleted draft characters do not show underneath.
+ 
+ A subset font contains only some of the original face's glyphs. A new character cannot be
+-reconstructed from a glyph the PDF does not contain. **Load font…** imports an openly licensed,
++reconstructed from a glyph the PDF does not contain. **Import font…** imports an openly licensed,
+ embeddable standalone `.ttf` or `.otf` face. **Installed fonts…** discovers eligible user-installed
+ faces on request, off the UI thread; the document-font menu selects resources already on the
+-page. Select **Keep source fonts** to preserve each run's original face. A matching full face
++page. The Edit a PDF sidebar now exposes **Document fonts** before a paragraph is selected.
++Import there to register a face on the current page without modifying any text; select existing
++text and choose that face in Format text. The same Import font and Installed fonts controls are
++visible in Format text while editing a paragraph. A file picker opened for one paragraph cannot
++apply to a different paragraph on the same page. Imports and subsequent rewrites remain separate
++undoable edits. Add Text uses the standard families only; imported faces are not yet supported in
++new text boxes. Select **Keep source fonts** to preserve each run's original face. A matching full face
+ completes its subsets automatically, including new Chinese characters. When the PDF itself embeds
+ the complete program of a paragraph's font (not a subset) and its licence allows editable
+ embedding, a character the font's encoding can't show is drawn with that same program. A
