@@ -1,0 +1,554 @@
+diff --git a/FONT-EDITOR-CHANGELOG.md b/FONT-EDITOR-CHANGELOG.md
+index 6dce7ce..4893b66 100644
+--- a/FONT-EDITOR-CHANGELOG.md
++++ b/FONT-EDITOR-CHANGELOG.md
+@@ -1,3 +1,14 @@
++# Font Editor V2 — Add Text (experimental)
++
++- Select a registered full static TTF/OTF in Format text for new or previously added text.
++- Reuse the existing PDF embedding engine, real unshaped font advances, Unicode maps and editable content metadata.
++- Custom faces accept only supported WinAnsi characters in this version; no contextual shaping, variable fonts or synthetic bold/italic. Import each actual style face separately.
++- The UI preview loads the selected face into egui; preview parity, CFF/OTF compatibility and Windows runtime still require testing.
++- Imports are registered per page; select the imported face from the dropdown after import. The last selected style follows the existing reusable Add Text behavior.
++- Build and test in GitHub Actions. Source patch validation is not a successful Rust compilation.
++
++---
++
+ # PDFCraft 0.22.0 — Font Editor V1 (unofficial source revision)
+ 
+ Base: user-supplied PDFCraft v0.22.0 archive, commit ac140f809d554981a5276d748e6193fcf4d4bdfa.
+diff --git a/crates/edit/src/added/draw.rs b/crates/edit/src/added/draw.rs
+index 917b386..5c1b24c 100644
+--- a/crates/edit/src/added/draw.rs
++++ b/crates/edit/src/added/draw.rs
+@@ -122,6 +122,43 @@ pub(super) fn draw(doc: &mut Document, c: &Content, view: [f64; 6], taken: &Dict
+     .into_bytes();
+     match c {
+         Content::Text(t) => {
++            if let Some(bytes) = &t.custom_font {
++                let (_, face) = pdfcraft_fonts::embedding::names(bytes).map_err(EditError::Invalid)?;
++                let mut available = taken.clone();
++                let name = pdfcraft_fonts::embedding::embed(doc, &mut available, bytes, &face).map_err(EditError::Invalid)?;
++                let font = available.get(name.as_bytes()).cloned().ok_or_else(|| EditError::Invalid("Custom font missing".into()))?;
++                let dict = doc.dict(&font).ok_or_else(|| EditError::Invalid("Custom font dictionary missing".into()))?;
++                let metrics = pdfcraft_fonts::pdf::Metrics::from_dict(doc, &dict);
++                let mut fonts = Dict::new();
++                fonts.set(name.as_bytes().to_vec(), font);
++                res.set(b"Font".to_vec(), Object::Dict(fonts));
++                let r = text_rect(t);
++                let all = wrapped(t);
++                let paragraphs: Vec<usize> = all.iter().map(|(_, _, p)| *p).collect();
++                out.extend(format!("BT /{name} {} Tf {} {} Tc 0 Tw\n", n(t.size), t.fill_op(), n(t.char_spacing)).bytes());
++                for (i, (line, ..)) in all.iter().enumerate() {
++                    let w = latin_width(t, line);
++                    let y = r[3] - (i as f64 * 1.2 + 0.95) * t.size;
++                    let (x, tw) = placed(t, r, &paragraphs, i, w, line.matches(' ').count(), false);
++                    let encoded = metrics.encode(line).ok_or_else(|| EditError::Invalid("Custom font cannot encode the text".into()))?;
++                    out.extend(format!("1 0 0 1 {} {} Tm ", n(x), n(y)).bytes());
++                    if tw == 0.0 {
++                        out.extend(literal(&encoded));
++                        out.extend_from_slice(b" Tj\n");
++                    } else {
++                        // PDF Tw does not apply to multibyte spaces. Use TJ after each word.
++                        out.extend_from_slice(b"[");
++                        for (j, part) in line.split_inclusive(' ').enumerate() {
++                            if j > 0 { out.extend(format!(" {} ", n(-tw * 1000.0 / t.size)).bytes()); }
++                            let codes = metrics.encode(part).ok_or_else(|| EditError::Invalid("Custom font cannot encode the text".into()))?;
++                            out.extend(literal(&codes));
++                        }
++                        out.extend_from_slice(b"] TJ\n");
++                    }
++                }
++                out.extend_from_slice(b"ET\nQ\n");
++                return Ok((out, res));
++            }
+             let base = t.family.base_font(t.bold, t.italic);
+             let name = font_name(base);
+             let mut font = Dict::new();
+diff --git a/crates/edit/src/added/layout.rs b/crates/edit/src/added/layout.rs
+index b4a805a..dff427a 100644
+--- a/crates/edit/src/added/layout.rs
++++ b/crates/edit/src/added/layout.rs
+@@ -14,7 +14,9 @@ pub(super) fn norm(r: [f64; 4]) -> [f64; 4] {
+ /// The advance of `s` in the item's standard font: its glyphs' widths and the character spacing
+ /// after each of them, as `Tc` moves the pen (ISO 32000-2 §9.3.2).
+ pub(super) fn latin_width(t: &AddedText, s: &str) -> f64 {
+-    t.family.width(s, t.size, t.bold, t.italic) + t.char_spacing * s.chars().count() as f64
++    let width = t.custom_font.as_ref().and_then(|font| pdfcraft_fonts::embedding::added_text_width(font, s, t.size))
++        .unwrap_or_else(|| t.family.width(s, t.size, t.bold, t.italic));
++    width + t.char_spacing * s.chars().count() as f64
+ }
+ 
+ /// The lines of a text item after wrapping to its box width.
+@@ -194,6 +196,11 @@ pub(super) fn is_hebrew(c: char) -> bool {
+ /// draw (or that has no face to draw it). Page-content tools refuse such text; the Add-text editor
+ /// keeps it open.
+ pub fn first_undrawable(t: &AddedText) -> Option<char> {
++    // V2 intentionally limits custom faces to the unshaped WinAnsi repertoire.
++    // Missing glyphs never silently fall back or become question marks.
++    if let Some(font) = &t.custom_font {
++        return pdfcraft_fonts::embedding::added_text_unsupported(font, &t.text);
++    }
+     if t.text.chars().any(is_thai) {
+         if let Some(c) = t.text.chars().find(|c| is_thai(*c) && !pdfcraft_fonts::thai_has(*c)) {
+             return Some(c);
+diff --git a/crates/edit/src/added/store.rs b/crates/edit/src/added/store.rs
+index 1ee4c9c..96010b8 100644
+--- a/crates/edit/src/added/store.rs
++++ b/crates/edit/src/added/store.rs
+@@ -28,7 +28,9 @@ fn read_value<T>(doc: &Document, o: &Object, f: impl FnOnce(&Object) -> T) -> T
+     }
+ }
+ 
+-fn parse(doc: &Document, d: &Dict) -> Option<Content> {
++type FontCache = std::collections::HashMap<ObjRef, Option<std::sync::Arc<Vec<u8>>>>;
++
++fn parse(doc: &Document, d: &Dict, font_cache: &mut FontCache, budget: &mut pdfcraft_cos::DecodeBudget) -> Option<Content> {
+     let r = nums(doc, d.get(b"Rect"));
+     let rect: [f64; 4] = r.try_into().ok()?;
+     match d.name(b"Kind")? {
+@@ -50,6 +52,14 @@ fn parse(doc: &Document, d: &Dict) -> Option<Content> {
+                 rect,
+                 text,
+                 family,
++                custom_font: d.get(b"CustomFont").and_then(Object::as_ref).and_then(|reference| {
++                    font_cache.entry(reference).or_insert_with(|| {
++                        let font = doc.dict(&Object::Ref(reference))?;
++                        let bytes = pdfcraft_fonts::pdf::embedded_sfnt_within(doc, &font, budget)?;
++                        pdfcraft_fonts::embedding::validate_document_input(&bytes).ok()?;
++                        Some(std::sync::Arc::new(bytes))
++                    }).clone()
++                }),
+                 bold,
+                 italic,
+                 size: d.get(b"Size").and_then(Object::as_f64).unwrap_or(12.0),
+@@ -60,6 +70,7 @@ fn parse(doc: &Document, d: &Dict) -> Option<Content> {
+                 // Items written before character spacing have none.
+                 char_spacing: d.get(b"CharSpacing").and_then(Object::as_f64).filter(|v| v.is_finite()).unwrap_or(0.0),
+             };
++            if d.get(b"CustomFont").is_some() && t.custom_font.is_none() { return None; }
+             // An ink whose look isn't the stored colour (a file edited by hand) is none.
+             t.drop_stale_ink();
+             // One that stands is the ink as painted, finer digits dropped, and its look.
+@@ -108,6 +119,8 @@ fn for_each_content_entry(doc: &Document, page: &pdfcraft_model::Page, mut visit
+ /// Finds page marks and editable added content in one pass over the page content entries.
+ pub fn scan_markers(doc: &Document) -> MarkerScan {
+     let mut scan = MarkerScan::default();
++    let mut font_cache = FontCache::new();
++    let mut font_budget = pdfcraft_cos::DecodeBudget::new(128 << 20, 0);
+     for (pi, page) in page_list(doc).iter().enumerate() {
+         for_each_content_entry(doc, page, |entry| {
+             with_resolved(doc, entry, |resolved| {
+@@ -137,7 +150,7 @@ pub fn scan_markers(doc: &Document) -> MarkerScan {
+                 let Some(params_object) = dict.get(b"PCAdded") else { return };
+                 with_resolved(doc, params_object, |resolved_params| {
+                     let Some(params) = resolved_params.as_dict() else { return };
+-                    if let Some(content) = parse(doc, params) {
++                    if let Some(content) = parse(doc, params, &mut font_cache, &mut font_budget) {
+                         // Display points depend on the page's /UserUnit. An item records the one it was
+                         // written for; none means 1, as for items written before display space followed
+                         // /UserUnit.
+@@ -179,6 +192,12 @@ fn validate(c: &Content) -> Result<(), EditError> {
+             if (r[2] - r[0]).abs() < 1.0 {
+                 return Err(EditError::Invalid("the text box is too narrow".into()));
+             }
++            if let Some(font) = &t.custom_font {
++                pdfcraft_fonts::embedding::validate_document_input(font).map_err(EditError::Invalid)?;
++                if t.bold || t.italic { return Err(EditError::Invalid("Choose the actual bold or italic font face instead.".into())); }
++                if let Some(c) = first_undrawable(t) { return Err(crate::undrawable(c)); }
++                return Ok(());
++            }
+             if t.text.chars().any(is_thai) && pdfcraft_fonts::document_thai_font().is_none() {
+                 return Err(thai_error(GlyphError::NoFont, &t.text));
+             }
+@@ -236,6 +255,14 @@ fn write(doc: &mut Document, page: usize, c: &Content, obj: Option<ObjRef>) -> R
+     let mut sd = Dict::new();
+     sd.set(b"PCMark".to_vec(), Object::name(TAG));
+     let mut added = params(c);
++    if matches!(c, Content::Text(t) if t.custom_font.is_some()) {
++        // draw_custom returns exactly one embedded font resource. Keep a reference in the
++        // marker, independent of page resource naming or subsequent page reordering.
++        let font = res.get(b"Font").and_then(Object::as_dict)
++            .and_then(|fonts| fonts.iter().next()).map(|(_, f)| f.clone())
++            .ok_or_else(|| EditError::Invalid("Custom font resource is missing".into()))?;
++        added.set(b"CustomFont".to_vec(), font);
++    }
+     if user_unit != 1.0 {
+         added.set(b"UserUnit".to_vec(), Object::Real(user_unit));
+     }
+@@ -266,7 +293,8 @@ pub fn list_added(doc: &Document) -> Vec<Added> {
+ /// Add an item to a page (0-based). Returns its index among the page's added items.
+ pub fn add_content(doc: &mut Document, page: usize, c: &Content) -> Result<usize, EditError> {
+     write(doc, page, c, None)?;
+-    Ok(list_added(doc).iter().filter(|a| a.page == page).count() - 1)
++    list_added(doc).iter().filter(|a| a.page == page).count().checked_sub(1)
++        .ok_or_else(|| EditError::Invalid("Added item could not be read back".into()))
+ }
+ 
+ fn find(doc: &Document, page: usize, index: usize) -> Result<Added, EditError> {
+diff --git a/crates/edit/src/added/types.rs b/crates/edit/src/added/types.rs
+index 24101b2..2a648f2 100644
+--- a/crates/edit/src/added/types.rs
++++ b/crates/edit/src/added/types.rs
+@@ -151,6 +151,8 @@ pub struct AddedText {
+     pub rect: [f64; 4],
+     pub text: String,
+     pub family: Family,
++    /// Explicit, validated static document font; shared across draft/style clones.
++    pub custom_font: Option<std::sync::Arc<Vec<u8>>>,
+     pub bold: bool,
+     pub italic: bool,
+     pub size: f64,
+@@ -221,6 +223,7 @@ impl Default for AddedText {
+             rect: [0.0; 4],
+             text: String::new(),
+             family: Family::Helvetica,
++            custom_font: None,
+             bold: false,
+             italic: false,
+             size: 12.0,
+diff --git a/crates/edit/src/tests.rs b/crates/edit/src/tests.rs
+index dd6ba09..87c7f01 100644
+--- a/crates/edit/src/tests.rs
++++ b/crates/edit/src/tests.rs
+@@ -15659,3 +15659,32 @@ fn thai_paragraphs_break_the_row_on_unicode_row_breaks() {
+         assert_eq!(rows(&doc), ["กข", "ค"], "matching U+{:04X}", u32::from(separator));
+     }
+ }
++
++#[test]
++fn custom_added_text_roundtrip_v2() {
++    let bytes = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
++    let mut doc = text_page("BT /F1 12 Tf 72 700 Td (Unchanged source) Tj ET");
++    let font = std::sync::Arc::new(bytes.to_vec());
++    let typed = "Café — Rp 123";
++    let text = AddedText { rect: [40.0, 400.0, 350.0, 430.0], text: typed.into(),
++        custom_font: Some(font.clone()), size: 14.0, ..Default::default() };
++    assert_eq!(first_undrawable(&text), None);
++    add_content(&mut doc, 0, &Content::Text(text.clone())).unwrap();
++    let mut doc = reopen(&doc);
++    let items = list_added(&doc);
++    let Content::Text(saved) = &items[0].content else { panic!("missing editable text") };
++    assert_eq!(saved.text, typed);
++    assert_eq!(saved.custom_font.as_deref(), Some(font.as_ref()));
++    assert!(page_font_programs(&doc).iter().any(|(kind, program)|
++        kind == b"Type0" && program.as_deref() == Some(bytes.as_slice())));
++    let changed = AddedText { text: "Revised 2026".into(), ..saved.clone() };
++    update_content(&mut doc, 0, 0, &Content::Text(changed)).unwrap();
++    let doc = reopen(&doc);
++    let items = list_added(&doc);
++    let Content::Text(saved) = &items[0].content else { panic!("missing editable text") };
++    assert_eq!(saved.text, "Revised 2026");
++    assert_eq!(saved.custom_font.as_deref(), Some(font.as_ref()));
++    assert!(text::text_lines(&doc, 0).unwrap().iter().any(|l| l.text.contains("Revised 2026")));
++    let unsupported = AddedText { text: "漢".into(), ..saved.clone() };
++    assert_eq!(first_undrawable(&unsupported), Some('漢'));
++}
+diff --git a/crates/engine/src/tests.rs b/crates/engine/src/tests.rs
+index b4ac4f8..8be73e0 100644
+--- a/crates/engine/src/tests.rs
++++ b/crates/engine/src/tests.rs
+@@ -5216,6 +5216,7 @@ fn pasted_added_content_keeps_its_style_and_picture() {
+         align: TextAlign::Center,
+         aligns: Vec::new(),
+         char_spacing: 0.0,
++        custom_font: None,
+     };
+     s.apply(id, Edit::AddText { page: 0, text: text.clone() }).unwrap();
+     let copied = s.get(id).unwrap().added()[0].content.clone();
+@@ -10907,6 +10908,7 @@ fn content_edit_keeps_pages_annotations_fields_and_links() {
+         align: TextAlign::Left,
+         aligns: Vec::new(),
+         char_spacing: 0.0,
++        custom_font: None,
+     };
+     session.apply(id, Edit::AddText { page: 1, text }).unwrap();
+     let after = session.get(id).unwrap();
+@@ -10949,6 +10951,7 @@ fn content_refresh_lists_match_the_storages_an_edit_touches() {
+                 align: TextAlign::Left,
+                 aligns: Vec::new(),
+                 char_spacing: 0.0,
++                custom_font: None,
+             },
+         },
+         Edit::MoveObjects { page: 0, objects: vec![target(crate::ObjectKind::Added)], offset: [1.0, 0.0] },
+diff --git a/crates/fonts/src/embedding.rs b/crates/fonts/src/embedding.rs
+index e3cb24b..375fc1d 100644
+--- a/crates/fonts/src/embedding.rs
++++ b/crates/fonts/src/embedding.rs
+@@ -31,6 +31,29 @@ pub fn covers(bytes: &[u8], text: &str) -> bool {
+     FontRef::new(bytes).is_ok_and(|f| text.chars().all(|c| matches!(c, '\n' | '\r') || f.charmap().map(c).is_some_and(|g| g.to_u32() != 0)))
+ }
+ 
++/// First unsupported character in an unshaped Latin Add Text string.
++pub fn added_text_unsupported(bytes: &[u8], text: &str) -> Option<char> {
++    let font = FontRef::new(bytes).ok();
++    let map = font.as_ref().map(|f| f.charmap());
++    text.chars().filter(|c| *c != '\n').find(|c| {
++        !crate::win_ansi_encodable(*c) || !map.as_ref().and_then(|m| m.map(*c)).is_some_and(|g| g.to_u32() != 0)
++    })
++}
++
++/// Unshaped Latin advance for explicitly selected static Add Text faces.
++pub fn added_text_width(bytes: &[u8], text: &str, size: f64) -> Option<f64> {
++    let font = FontRef::new(bytes).ok()?;
++    let metrics = font.metrics(Size::unscaled(), LocationRef::default());
++    if metrics.units_per_em == 0 { return None; }
++    let glyphs = font.glyph_metrics(Size::unscaled(), LocationRef::default());
++    let map = font.charmap();
++    let mut width = 0.0;
++    for c in text.chars() {
++        width += f64::from(glyphs.advance_width(map.map(c)?)?);
++    }
++    Some(width * size / f64::from(metrics.units_per_em))
++}
++
+ /// Names come from the program, never a caller's guessed family.
+ pub fn names(bytes: &[u8]) -> Result<(String, String), String> {
+     use skrifa::string::StringId;
+diff --git a/crates/ui-egui/src/panels/edit.rs b/crates/ui-egui/src/panels/edit.rs
+index 6fa93fb..e3cce76 100644
+--- a/crates/ui-egui/src/panels/edit.rs
++++ b/crates/ui-egui/src/panels/edit.rs
+@@ -57,12 +57,14 @@ pub(super) fn edit_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui, t: &Tokens, g
+     // Make import discoverable even before a text paragraph has been opened.
+     if let Some((index, _)) = app.active_ids()
+         && app.views[index].line_editor.is_none()
++        && app.views[index].content.draft.is_none()
++        && app.quick_tool != crate::QuickTool::AddText
+     {
+         let page = app.views[index].current;
+         let enabled = pdfcraft_engine::commands::command("edit.edit_text").is_some_and(|spec| app.command_enabled(spec));
+         widgets::section_title(ui, tl!("Document fonts"));
+         let choice = ui.add_enabled_ui(enabled, crate::format_text_ui::import_controls).inner;
+-        ui.label(tl!("Import fonts for the current page, then select existing text to apply them."));
++        ui.label(tl!("Import fonts for the current page, then choose a font in Format text."));
+         handle_font_import(app, page, None, choice);
+         ui.add_space(6.0);
+     }
+@@ -336,7 +338,8 @@ fn format_section(app: &mut PdfCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+         }
+         let mut style = draft.style.clone();
+         let paragraphs = crate::format_text_ui::Paragraphs { text: &draft.text, selection: draft.selection.clone(), tidy: true };
+-        let out = added_text_format(ui, t, &mut style, Some(paragraphs));
++        let fonts = added_fonts(app, ui.ctx(), draft.page);
++        let out = added_text_format(ui, t, &mut style, Some(paragraphs), &fonts);
+         if let Some(script) = out.script {
+             let mut toggled = draft.clone();
+             if crate::edit_text_ui::toggle_script(&mut toggled.text, &mut toggled.selection, script) {
+@@ -346,6 +349,7 @@ fn format_section(app: &mut PdfCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+         if style != draft.style {
+             app.restyle_draft(i, style);
+         }
++        handle_font_import(app, draft.page, None, out.font);
+         return;
+     }
+     let image = app.active_ids().and_then(|(i, id)| {
+@@ -380,19 +384,26 @@ fn format_section(app: &mut PdfCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+     match selected {
+         Some((page, index, text)) => {
+             let mut style = text.clone();
+-            added_text_format(ui, t, &mut style, None);
++            let fonts = added_fonts(app, ui.ctx(), page);
++            let out = added_text_format(ui, t, &mut style, None, &fonts);
+             if style != text {
+                 // The reusable style follows the selection only when the edit took, so a refused one adds nothing odd later.
+                 if app.apply_edit(pdfcraft_engine::Edit::UpdateContent { page, index, content: pdfcraft_engine::AddedContent::Text(style.clone()) }) {
+                     app.text_style = pdfcraft_engine::AddedText { text: String::new(), rect: [0.0; 4], aligns: Vec::new(), ..style };
+                 }
+             }
++            handle_font_import(app, page, None, out.font);
+         }
+         None if app.quick_tool == crate::QuickTool::AddText => {
+             crate::content_ui::hint(ui, t);
+             let mut style = app.text_style.clone();
+-            added_text_format(ui, t, &mut style, None);
+-            app.text_style = style;
++            if let Some((i, _)) = app.active_ids() {
++                let page = app.views[i].current;
++                let fonts = added_fonts(app, ui.ctx(), page);
++                let out = added_text_format(ui, t, &mut style, None, &fonts);
++                app.text_style = style;
++                handle_font_import(app, page, None, out.font);
++            }
+         }
+         None => {}
+     }
+@@ -410,18 +421,50 @@ fn handle_font_import(app: &mut PdfCraftApp, page: usize, block: Option<usize>,
+     }
+ }
+ 
+-/// Format text for added text: the standard families, size, colour, style and alignment
++/// Only explicitly registered full faces, not arbitrary source subsets or UI fonts.
++fn added_fonts(app: &PdfCraftApp, ctx: &egui::Context, page: usize) -> std::sync::Arc<Vec<(String, String, Vec<u8>)>> {
++    let Some((_, id)) = app.active_ids() else { return Default::default() };
++    let Some(doc) = app.session.get(id) else { return Default::default() };
++    let cache_id = egui::Id::new("added-font-catalog-v2");
++    type Cache = ((pdfcraft_engine::DocId, usize, u64), std::sync::Arc<Vec<(String, String, Vec<u8>)>>);
++    let key = (id, page, doc.edit_generation());
++    if let Some((cached, fonts)) = ctx.data(|d| d.get_temp::<Cache>(cache_id))
++        && cached == key
++    { return fonts; }
++    let fonts = std::sync::Arc::new(doc.text_editor_fonts(page).into_iter()
++        .filter(|f| f.resource.starts_with("PCFull") && pdfcraft_fonts::embedding::validate_document_input(&f.bytes).is_ok())
++        .map(|f| (f.resource, f.face, f.bytes)).collect::<Vec<_>>());
++    ctx.data_mut(|d| d.insert_temp(cache_id, (key, fonts.clone())));
++    fonts
++}
++
++/// Format text for added text: the standard and imported families, size, colour, style and alignment
+ /// (of the lines `paragraphs` selects, while the text is being typed).
+ fn added_text_format(
+     ui: &mut egui::Ui,
+     t: &Tokens,
+     style: &mut pdfcraft_engine::AddedText,
+     paragraphs: Option<crate::format_text_ui::Paragraphs>,
++    fonts: &[(String, String, Vec<u8>)],
+ ) -> crate::format_text_ui::Outcome {
+-    let shown = style.family.label().to_string();
+-    let out = crate::format_text_ui::panel(ui, t, style, None, crate::format_text_ui::Fonts { sources: None, shown, mixed_size: false }, paragraphs);
+-    if let Some(crate::format_text_ui::FontChoice::Family(family)) = out.font {
+-        style.family = family;
++    use crate::format_text_ui::FontChoice;
++    let shown = style.custom_font.as_ref().and_then(|b| pdfcraft_fonts::embedding::names(b).ok())
++        .map(|(_, face)| face).unwrap_or_else(|| style.family.label().to_string());
++    let choices: Vec<_> = fonts.iter().map(|(r, face, _)| (r.clone(), face.clone())).collect();
++    let out = crate::format_text_ui::panel(ui, t, style, None, crate::format_text_ui::Fonts { sources: Some(&choices), shown, mixed_size: false }, paragraphs);
++    match &out.font {
++        Some(FontChoice::Family(family)) => { style.family = *family; style.custom_font = None; }
++        Some(FontChoice::Resource(resource)) => {
++            if let Some((_, _, bytes)) = fonts.iter().find(|(r, _, _)| r == resource) {
++                style.custom_font = Some(std::sync::Arc::new(bytes.clone()));
++                style.bold = false;
++                style.italic = false;
++            }
++        }
++        _ => {}
++    }
++    if style.custom_font.is_some() {
++        ui.label(tl!("For bold or italic, import and select the corresponding font file."));
+     }
+     out
+ }
+@@ -438,8 +481,10 @@ impl PdfCraftApp {
+         style.drop_stale_ink();
+         let Some(view) = self.views.get_mut(index) else { return };
+         // Text the standard fonts can't draw stays in the box, unwritten, until it is corrected (#125).
+-        let blocked = view.content.blocked().is_some();
+         let Some(d) = view.content.draft.as_mut() else { return };
++        let blocked = pdfcraft_engine::first_undrawable(&pdfcraft_engine::AddedText {
++            text: d.text.trim_end().to_string(), rect: d.rect, ..style.clone()
++        }).is_some();
+         let committed = d.style.clone();
+         // `text` and `rect` stay what the page has; the rest is the new style.
+         d.style = pdfcraft_engine::AddedText { text: committed.text.clone(), rect: committed.rect, ..style };
+diff --git a/crates/ui-egui/src/panels/format_text_ui.rs b/crates/ui-egui/src/panels/format_text_ui.rs
+index 061acbb..0e98564 100644
+--- a/crates/ui-egui/src/panels/format_text_ui.rs
++++ b/crates/ui-egui/src/panels/format_text_ui.rs
+@@ -34,8 +34,7 @@ pub(crate) enum FontChoice {
+ 
+ /// What the font list offers and shows.
+ pub(crate) struct Fonts<'a> {
+-    /// The fonts on the paragraph's page (resource, face); `None` for added text, which has the
+-    /// standard families only.
++    /// The selectable fonts on the active page (resource, face).
+     pub sources: Option<&'a [(String, String)]>,
+     /// The name the list shows for the current choice.
+     pub shown: String,
+@@ -247,7 +246,7 @@ pub(crate) fn panel(
+             .width(width)
+             .show_ui(ui, |ui| {
+                 if let Some(sources) = fonts.sources {
+-                    if ui.selectable_label(false, tl!("Keep source fonts")).clicked() {
++                    if extras.is_some() && ui.selectable_label(false, tl!("Keep source fonts")).clicked() {
+                         out.font = Some(FontChoice::KeepSource);
+                     }
+                     for (resource, face) in sources.iter().filter(|(r, _)| !r.starts_with("PCApproved")) {
+@@ -258,7 +257,7 @@ pub(crate) fn panel(
+                     ui.separator();
+                 }
+                 for f in [FontFamily::Helvetica, FontFamily::Times, FontFamily::Courier] {
+-                    if ui.selectable_label(fonts.sources.is_none() && look.family == f, f.label()).clicked() {
++                    if ui.selectable_label(extras.is_none() && look.custom_font.is_none() && look.family == f, f.label()).clicked() {
+                         out.font = Some(FontChoice::Family(f));
+                     }
+                 }
+@@ -281,8 +280,6 @@ pub(crate) fn panel(
+         if let Some(choice) = import_controls(ui) {
+             out.font = Some(choice);
+         }
+-    } else {
+-        ui.label(tl!("Custom document fonts are available for editing existing PDF text, not for Add Text yet."));
+     }
+     ui.add_space(4.0);
+ 
+@@ -341,10 +338,10 @@ pub(crate) fn panel(
+     // Bold, italic, underline, superscript, subscript.
+     let mut extras = extras;
+     row(ui, |ui| {
+-        if icons::button(ui, "bold", 30.0, look.bold, tl!("Bold")).clicked() {
++        if ui.add_enabled_ui(look.custom_font.is_none(), |ui| icons::button(ui, "bold", 30.0, look.bold, tl!("Bold"))).inner.clicked() {
+             look.bold = !look.bold;
+         }
+-        if icons::button(ui, "italic", 30.0, look.italic, tl!("Italic")).clicked() {
++        if ui.add_enabled_ui(look.custom_font.is_none(), |ui| icons::button(ui, "italic", 30.0, look.italic, tl!("Italic"))).inner.clicked() {
+             look.italic = !look.italic;
+         }
+         match extras.as_deref_mut() {
+diff --git a/crates/ui-egui/src/tools/content_ui.rs b/crates/ui-egui/src/tools/content_ui.rs
+index 6dab248..3d8a126 100644
+--- a/crates/ui-egui/src/tools/content_ui.rs
++++ b/crates/ui-egui/src/tools/content_ui.rs
+@@ -671,6 +671,28 @@ pub(crate) fn after_refresh(view: &mut DocView, added: &[Added]) {
+     }
+ }
+ 
++/// Register the current custom face in the preview atlas, not the default UI family.
++/// The new atlas is usable on the following frame.
++fn custom_preview_font(ctx: &egui::Context, style: &AddedText, size: f32) -> Option<egui::FontId> {
++    use std::hash::{Hash, Hasher};
++    let bytes = style.custom_font.as_ref()?;
++    let mut hasher = std::collections::hash_map::DefaultHasher::new();
++    bytes.hash(&mut hasher);
++    let name = format!("pdf-added-{:016x}", hasher.finish());
++    let family = egui::FontFamily::Name(name.clone().into());
++    if ctx.fonts(|f| f.definitions().families.contains_key(&family)) {
++        return Some(egui::FontId::new(size, family));
++    }
++    let mut definitions = ctx.fonts(|f| f.definitions().clone());
++    definitions.font_data.retain(|n, _| !n.starts_with("pdf-added-"));
++    definitions.families.retain(|f, _| !matches!(f, egui::FontFamily::Name(n) if n.starts_with("pdf-added-")));
++    definitions.font_data.insert(name.clone(), std::sync::Arc::new(egui::FontData::from_owned(bytes.as_ref().clone())));
++    definitions.families.insert(family, vec![name]);
++    ctx.set_fonts(definitions);
++    ctx.request_repaint();
++    None
++}
++
+ /// The in-place text editor, with Done and Discard beside it. Returns the edit once the text is
+ /// committed (a click away, or Done), and whether Done finished adding text. Discard or Escape
+ /// throws the draft away.
+@@ -680,7 +702,8 @@ pub(crate) fn editor(ctx: &egui::Context, keys: PageKeys, view: &mut DocView, in
+     let Some(xf) = view.page_xform(page) else { return (None, false) };
+     let zoom = xf.zoom();
+     let Some(draft) = view.content.draft.as_mut() else { return (None, false) };
+-    let font = crate::edit_text_ui::editor_font(&draft.style, (draft.style.size as f32 * zoom).clamp(1.0, 300.0));
++    let size = (draft.style.size as f32 * zoom).clamp(1.0, 300.0);
++    let font = custom_preview_font(ctx, &draft.style, size).unwrap_or_else(|| crate::edit_text_ui::editor_font(&draft.style, size));
+     let text = AddedText { text: draft.text.clone(), ..draft.style.clone() };
+     let Some(page_width) = info.pages.get(page).map(|p| p.width as f64) else { return (None, false) };
+     if let Some((key, z, width, rect)) = &view.content.layout
+diff --git a/crates/ui-egui/src/workflows/files.rs b/crates/ui-egui/src/workflows/files.rs
+index 861e12a..f9d631f 100644
+--- a/crates/ui-egui/src/workflows/files.rs
++++ b/crates/ui-egui/src/workflows/files.rs
+@@ -583,7 +583,7 @@ impl PdfCraftApp {
+                         self.apply_line_format(index, ed, ctx.as_ref());
+                     }
+                     (Some(_), None) => {
+-                        self.notify_tr("Font imported for this page. Select existing text and choose the font from Format text.");
++                        self.notify_tr("Font imported for this page. Choose it in Format text for new or existing text.");
+                     }
+                     (None, editor) => {
+                         if let Some(mut ed) = editor
