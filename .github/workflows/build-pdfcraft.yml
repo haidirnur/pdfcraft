@@ -1,40 +1,19 @@
-name: Build PDFCraft Font Editor V1
-on:
-  workflow_dispatch:
-    inputs:
-      run_tests:
-        description: Run targeted text editor tests before building
-        type: boolean
-        default: false
-permissions:
-  contents: read
-jobs:
-  windows-x64:
-    runs-on: windows-2022
-    timeout-minutes: 180
-    env:
-      CARGO_INCREMENTAL: '0'
-      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
-      PDFCRAFT_BUILD_LABEL: fonteditor.v1
-      PDFCRAFT_REQUIRE_WINRES: '1'
-    steps:
-      - name: Checkout build files
-        uses: actions/checkout@v4
-      - name: Checkout exact upstream source
-        uses: actions/checkout@v4
-        with:
-          repository: storytold/pdfcraft
-          ref: ac140f809d554981a5276d748e6193fcf4d4bdfa
-          path: source
-          persist-credentials: false
-      - name: Apply Font Editor V1 patch
-        shell: pwsh
-        working-directory: source
         run: |
-          git apply --check ../PDFCraft_Font_Editor_V1.patch
-          if ($LASTEXITCODE -ne 0) { throw 'Patch validation failed' }
-          git apply ../PDFCraft_Font_Editor_V1.patch
-          if ($LASTEXITCODE -ne 0) { throw 'Patch application failed' }
+          $expected = 'ac140f809d554981a5276d748e6193fcf4d4bdfa'
+          $actual = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -ne $expected) { throw "Unexpected upstream commit: $actual" }
+          $original = (Resolve-Path '../PDFCraft_Font_Editor_V1.patch').Path
+          $patch = Join-Path $env:RUNNER_TEMP 'PDFCraft_Font_Editor_V1_LF.patch'
+          $raw = [System.IO.File]::ReadAllText($original)
+          $normalized = $raw.Replace("`r`n", "`n").Replace("`r", "`n")
+          [System.IO.File]::WriteAllText($patch, $normalized, [System.Text.UTF8Encoding]::new($false))
+          Write-Host "Upstream commit: $actual"
+          Write-Host "Normalized patch SHA256: $((Get-FileHash -LiteralPath $patch -Algorithm SHA256).Hash)"
+          git apply --check --verbose $patch
+          if ($LASTEXITCODE -ne 0) { throw 'Normalized patch validation failed' }
+          git apply --verbose $patch
+          if ($LASTEXITCODE -ne 0) { throw 'Normalized patch application failed' }
+          git diff --stat
       - name: Configure Rust MSVC
         shell: pwsh
         run: |
